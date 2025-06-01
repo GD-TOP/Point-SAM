@@ -195,3 +195,5 @@ cython_debug/
 
 *.pth
 *.ply
+configs/dataset
+configs/loss
