@@ -14,6 +14,7 @@ from pc_sam.ply_utils import load_ply
 
 import numpy as np
 import torch
+from sklearn.cluster import KMeans
 
 @dataclasses.dataclass
 class AuxInputs:
@@ -164,8 +165,8 @@ class PointCloudSAMPredictor:
             pc_embeddings, patches = pc_embedding, patches
             centers = patches["centers"]
             knn_idx = patches["knn_idx"]
-            coords = patches["coords"]
-            feats = patches["feats"]
+            #coords = patches["coords"]
+            #feats = patches["feats"]
             aux_inputs = AuxInputs(coords=coords, features=feats, centers=centers)
 
             pc_pe = self.model.point_encoder.pe_layer(centers)
@@ -271,6 +272,36 @@ def main():
         # set prompt coordinates and labels
         # coordinates - expected area for masking foots
         # labels - 0: no mask area / 1: mask area
+        num_foot_candidates = 20
+        foot_indices = np.argsort(xyz[:, -1])[:num_foot_candidates]
+        foot_points = xyz[foot_indices]
+        
+        x_values = foot_points[:, 0].reshape(-1, 1)
+        
+        kmeans = KMeans(n_clusters=2, n_init=10).fit(x_values)
+        labels = kmeans.labels_
+        
+        cluster_centers = kmeans.cluster_centers_.flatten()
+        left_foot_idx = np.argmin(cluster_centers)
+        right_foot_idx = np.argmax(cluster_centers)
+        
+        left_foot_points = foot_points[labels == left_foot_idx]
+        right_foot_points = foot_points[labels == right_foot_idx]
+        
+        N_PROMPT = 2
+        left_prompt = left_foot_points[:N_PROMPT]
+        model.set_prompts(left_prompt, np.ones(left_prompt.shape[0], dtype=np.int32))
+        left_mask = model.predict_mask()
+        
+        right_prompt = right_foot_points[:N_PROMPT]
+        model.set_prompts(right_prompt, np.ones(right_prompt.shape[0], dtype=np.int32))
+        right_mask = model.predict_mask()
+        
+        seg_label = np.zeros(xyz.shape[0], dtype=np.int32)
+        seg_label[left_mask > 0] = 1
+        seg_label[right_mask > 0] = 2
+        
+        out_points = np.concatenate([points, seg_label[:, None]], axis=1)
         
         print()
         
