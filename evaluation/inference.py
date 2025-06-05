@@ -1,3 +1,4 @@
+import os
 import sys
 import dataclasses
 
@@ -10,7 +11,7 @@ from accelerate.utils import set_seed
 from pc_sam.model.pc_sam import PointCloudSAM
 from pc_sam.utils.torch_utils import replace_with_fused_layernorm
 from safetensors.torch import load_model
-from pc_sam.ply_utils import load_ply
+from utils import load_ply, save_ply
 
 import numpy as np
 import torch
@@ -261,49 +262,112 @@ def main():
     with torch.no_grad():
         
         # load pcd from ply file and set on model
-        points = load_ply(f"{args.pointcloud}")
+        points, normal_coords, alpha = load_ply(f"{args.pointcloud}")
         xyz = points[:, :3]
         rgb = points[:, 3:6]
+        alpha = alpha.astype(np.int32)
         
         xyz = np.array(xyz).reshape(-1, 3)
         rgb = np.array(list(rgb)).reshape(-1, 3)
         model.set_pointcloud(xyz, rgb)
         
-        # set prompt coordinates and labels
-        # coordinates - expected area for masking foots
-        # labels - 0: no mask area / 1: mask area
+        # # x축 0 기준으로 왼발/오른발 분리
+        # num_foot_candidates = 200
+        # foot_indices = np.argsort(xyz[:, 1])[:num_foot_candidates]
+        # foot_points = xyz[foot_indices]
+        # left_cluster_idxs = foot_indices[foot_points[:, 0] < 0]
+        # right_cluster_idxs = foot_indices[foot_points[:, 0] >= 0]
+
+        # if len(left_cluster_idxs) == 0 or len(right_cluster_idxs) == 0:
+        #     print("x=0 기준으로 분리된 왼발 또는 오른발 후보가 없습니다.")
+        #     return
+
+        # # 왼발 프롬프트 (상위 10개)
+        # left_selected = left_cluster_idxs[:10]
+        # left_prompt_coords = xyz[left_selected]
+        # left_prompt_labels = np.ones(left_prompt_coords.shape[0], dtype=np.int32)
+        # model.set_prompts(left_prompt_coords, left_prompt_labels)
+        # left_mask = model.predict_mask()[0]
+
+        # # 오른발 후보에서 왼발 제외
+        # right_candidates = right_cluster_idxs[~left_mask[right_cluster_idxs]]
+        # if len(right_candidates) == 0:
+        #     print("오른발 후보가 없습니다. 왼발 마스크가 전체를 차지했습니다.")
+        #     return
+        # right_selected = right_candidates[:10]
+        # right_prompt_coords = xyz[right_selected]
+        # right_prompt_labels = np.ones(right_prompt_coords.shape[0], dtype=np.int32)
+        # model.set_prompts(right_prompt_coords, right_prompt_labels)
+        # right_mask = model.predict_mask()[0]
+
+        # # 최종 마스크: 겹치지 않도록
+        # left_binary = left_mask
+        # right_binary = right_mask & (~left_binary)
+
+        # overlap = left_binary & right_binary
+        # num_overlap = np.sum(overlap)
+        # num_left = np.sum(left_binary)
+        # num_right = np.sum(right_binary)
+
+        # print(f"겹치는 포인트 개수: {num_overlap}")
+        # print(f"왼발 마스크 포인트 개수: {num_left}")
+        # print(f"오른발 마스크 포인트 개수: {num_right}")
+        # if num_overlap > 0:
+        #     overlap_ratio_left = num_overlap / (num_left + 1e-6)
+        #     overlap_ratio_right = num_overlap / (num_right + 1e-6)
+        #     print(f"왼발 내 겹침 비율: {overlap_ratio_left:.3%}")
+        #     print(f"오른발 내 겹침 비율: {overlap_ratio_right:.3%}")
+        #     print("겹치는 인덱스(처음 10개):", np.where(overlap)[0][:10])
+        # else:
+        #     print("겹치는 포인트가 없습니다.")
+
+        # seg_label = np.zeros(xyz.shape[0], dtype=np.int32)
+        # seg_label[left_binary] = 1
+        # seg_label[right_binary] = 2
+        
+        # 첫 번째 프롬프트로 전체 발 영역 마스크 예측
         num_foot_candidates = 20
-        foot_indices = np.argsort(xyz[:, -1])[:num_foot_candidates]
+        foot_indices = np.argsort(xyz[:, 1])[:num_foot_candidates]
         foot_points = xyz[foot_indices]
-        
-        x_values = foot_points[:, 0].reshape(-1, 1)
-        
-        kmeans = KMeans(n_clusters=2, n_init=10).fit(x_values)
-        labels = kmeans.labels_
-        
-        cluster_centers = kmeans.cluster_centers_.flatten()
-        left_foot_idx = np.argmin(cluster_centers)
-        right_foot_idx = np.argmax(cluster_centers)
-        
-        left_foot_points = foot_points[labels == left_foot_idx]
-        right_foot_points = foot_points[labels == right_foot_idx]
-        
-        N_PROMPT = 2
-        left_prompt = left_foot_points[:N_PROMPT]
-        model.set_prompts(left_prompt, np.ones(left_prompt.shape[0], dtype=np.int32))
-        left_mask = model.predict_mask()
-        
-        right_prompt = right_foot_points[:N_PROMPT]
-        model.set_prompts(right_prompt, np.ones(right_prompt.shape[0], dtype=np.int32))
-        right_mask = model.predict_mask()
-        
+        xz_values = foot_points[:, [0, 2]]
+        kmeans = KMeans(n_clusters=2, n_init=20, random_state=42).fit(xz_values)
+        # 클러스터 중 하나만 사용해 간단히 발 영역 프롬프트로 삼기
+        cluster_label = 1  # 예시로 첫 번째 클러스터 사용
+        foot_cluster_idxs = foot_indices[kmeans.labels_ == cluster_label]
+        prompt_idxs = foot_cluster_idxs[:10]
+        prompt_coords = xyz[prompt_idxs]
+        prompt_labels = np.ones(prompt_coords.shape[0], dtype=np.int32)
+        model.set_prompts(prompt_coords, prompt_labels)
+        foot_mask = model.predict_mask()[0]
+
+        # 후처리: x축 기준으로 왼발(1), 오른발(2)로 분리
         seg_label = np.zeros(xyz.shape[0], dtype=np.int32)
-        seg_label[left_mask > 0] = 1
-        seg_label[right_mask > 0] = 2
+        foot_indices_all = np.where(foot_mask)[0]
+        for idx in foot_indices_all:
+            if xyz[idx, 0] < 0:
+                seg_label[idx] = 1
+            else:
+                seg_label[idx] = 2
+
+        # 통계 출력
+        num_left = np.sum(seg_label == 1)
+        num_right = np.sum(seg_label == 2)
+        print(f"왼발 마스크 포인트 개수: {num_left}")
+        print(f"오른발 마스크 포인트 개수: {num_right}")
         
-        out_points = np.concatenate([points, seg_label[:, None]], axis=1)
+        xyz_t = torch.tensor(points[:, :3], dtype=torch.float32)
+        normal_coords_t = torch.tensor(normal_coords, dtype=torch.float32)
+        rgb_t = torch.tensor(points[:, 3:], dtype=torch.int32)
+        alpha_t = torch.tensor(alpha, dtype=torch.int32)
+        seg_label_t = torch.tensor(seg_label[:, None], dtype=torch.int8)
         
-        print()
+        out_points = torch.cat([xyz_t, normal_coords_t, rgb_t, alpha_t, seg_label_t], dim=1) #np.concatenate(out_points, axis=1)
+        out_points = out_points.cpu().numpy()
+        
+        if not os.path.exists(args.output_dir):
+            os.makedirs(args.output_dir)
+        save_ply(f"{args.output_dir}/{args.pointcloud.split('/')[-1].split('.')[0]}_segment_kmeans_change11.ply", out_points)
+        print("done")
         
 
     #data = {"xyz": coords, "rgb": colors, "mask": labels}
